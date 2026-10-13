@@ -15,7 +15,6 @@ export function simple(value: unknown, explode = false, encode = plain): string 
 }
 
 export function pathValue(p: Parameter, value: unknown): string {
-  if (p['x-mcp-omit-path-values']?.includes(value)) return '';
   const encoded = simple(value, p.explode ?? false, uri);
   switch (p.style ?? 'simple') {
     case 'simple': return encoded;

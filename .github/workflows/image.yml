@@ -44,7 +44,7 @@ jobs:
             type=sha,format=long
           labels: |
             org.opencontainers.image.title=api-mcp
-            org.opencontainers.image.description=OpenAPI-to-MCP gateway for Bifrost, built on Bun
+            org.opencontainers.image.description=Turns OpenAPI documents listed in OPENAPI_SPECS into MCP servers at runtime
 
       # Tests and type checks run inside the build, on the same Bun that ships.
       - id: build

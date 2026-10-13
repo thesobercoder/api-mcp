@@ -1,14 +1,40 @@
 import type { ValidateFunction } from 'ajv';
 
-export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
-export type JsonObject = { [key: string]: Json };
 export type Env = Record<string, string | undefined>;
 export type Fetcher = (url: URL, init: RequestInit) => Promise<Response>;
 export type Log = (event: Record<string, unknown>) => void;
 
-/** OpenAPI documents are user-supplied and loosely typed. */
+/** OpenAPI documents are fetched at runtime and loosely typed. */
 // biome-ignore lint/suspicious/noExplicitAny: OpenAPI input is arbitrary JSON.
 export type Spec = any;
+
+export interface SecurityBinding {
+  sourceHeader?: string;
+  stripBearer?: boolean;
+}
+
+/** Everything about an API that comes from environment variables. */
+export interface ApiOptions {
+  baseUrl?: string;
+  headers: [string, string][];
+  specHeaders: [string, string][];
+  forwardHeaders: string[];
+  securityBindings: Record<string, SecurityBinding>;
+  readOnly: boolean;
+  include: string[];
+  exclude: string[];
+  includeDeprecated: boolean;
+  optionalTrailingPathParams: boolean;
+  responseHeaders: string[];
+  instructions?: string;
+}
+
+/** One configured API: where its OpenAPI document lives and how to expose it. */
+export interface ApiSource {
+  name: string;
+  url: string;
+  options: ApiOptions;
+}
 
 export interface Parameter {
   name: string;
@@ -17,7 +43,6 @@ export interface Parameter {
   style?: string;
   explode?: boolean;
   required?: boolean;
-  'x-mcp-omit-path-values'?: unknown[];
 }
 
 export interface RequestBody {
@@ -31,43 +56,11 @@ export interface Operation {
   method: string;
   security?: Record<string, string[]>[];
   parameters: Parameter[];
+  /** Trailing `/{param}` segments that are dropped when their argument is omitted, outermost last. */
+  optionalTrailing: Parameter[];
   body: RequestBody | null;
-  validate: ValidateFunction;
-}
-
-export interface SecurityBinding {
-  sourceHeader?: string;
-  stripBearer?: boolean;
-}
-
-export interface ApiDefinition {
-  name: string;
-  baseUrl?: string;
-  headers?: Record<string, string | { env: string }>;
-  forwardHeaders?: string[];
-  securityBindings?: Record<string, SecurityBinding>;
-  wrapResponse?: boolean;
-  responseHeaders?: Record<string, string>;
-  responseHeadersKey?: string;
-  instructions?: string;
-  spec: Spec;
-}
-
-export interface Api {
-  name: string;
-  base: URL;
-  basePath: string;
-  headers: [string, string][];
-  forwardHeaders: string[];
-  securityBindings: Record<string, SecurityBinding>;
-  securitySchemes: Record<string, Spec>;
-  defaultSecurity: Record<string, string[]>[];
-  wrap: { key: string; headers: [string, string][] } | null;
-  operations: Map<string, Operation>;
-  tools: Tool[];
-  /** Pre-serialised JSON responses, built once at startup. */
-  toolsJson: string;
-  instructions: string;
+  /** Compiled on first call: large specs expose hundreds of tools, most never used. */
+  validator: () => ValidateFunction;
 }
 
 export interface Tool {
@@ -75,6 +68,21 @@ export interface Tool {
   description: string;
   inputSchema: Spec;
   annotations: { readOnlyHint: boolean; destructiveHint: boolean; idempotentHint: boolean; openWorldHint: boolean };
+}
+
+export interface Api {
+  name: string;
+  base: URL;
+  basePath: string;
+  options: ApiOptions;
+  responseHeaders: RegExp | null;
+  securitySchemes: Record<string, Spec>;
+  defaultSecurity: Record<string, string[]>[];
+  operations: Map<string, Operation>;
+  tools: Tool[];
+  /** Pre-serialised `tools/list` result, built once per load. */
+  toolsJson: string;
+  instructions: string;
 }
 
 export interface Limits {

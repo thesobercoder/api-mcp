@@ -5,8 +5,8 @@ export interface Credential { location: 'header' | 'query' | 'cookie'; name: str
 
 /** Applies static and forwarded headers, then picks the first satisfiable security requirement. */
 export function applySecurity(api: Api, op: Operation, request: Request, headers: Headers): Credential[] {
-  for (const [name, value] of api.headers) headers.set(name, value);
-  for (const name of api.forwardHeaders) {
+  for (const [name, value] of api.options.headers) headers.set(name, value);
+  for (const name of api.options.forwardHeaders) {
     const value = request.headers.get(name);
     if (value) headers.set(name, value);
   }
@@ -18,7 +18,7 @@ export function applySecurity(api: Api, op: Operation, request: Request, headers
     for (const name of Object.keys(group)) {
       const scheme = api.securitySchemes[name];
       if (!scheme) throw new ConfigError('Unknown security scheme.');
-      const binding = api.securityBindings[name] ?? {};
+      const binding = api.options.securityBindings[name] ?? {};
       const source = binding.sourceHeader ?? (scheme.type === 'apiKey' ? scheme.name : 'authorization');
       let value = headers.get(source) ?? request.headers.get(source);
       if (!value) { satisfied = false; break; }

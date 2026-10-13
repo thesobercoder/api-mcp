@@ -18,8 +18,16 @@ export default defineRailway(() => {
       overlapSeconds: 10,
     },
     // No public domains or TCP proxies. Private DNS uses the service name.
+    // All API definitions come from these variables at runtime; nothing is baked into the image.
     env: {
+      OPENAPI_SPECS: "trakt=https://developer.trakt.tv/openapi.json,whoop=https://api.prod.whoop.com/developer/doc/openapi.json",
       TRAKT_CLIENT_ID: preserve(),
+      API_TRAKT_HEADERS: '{"trakt-api-key":"${TRAKT_CLIENT_ID}","trakt-api-version":"2"}',
+      API_TRAKT_READ_ONLY: "true",
+      API_TRAKT_OPTIONAL_TRAILING_PATH_PARAMS: "true",
+      API_WHOOP_READ_ONLY: "true",
+      API_WHOOP_EXCLUDE: "tag:Partner* path:/v2/partner/*",
+      SPEC_REFRESH_SECONDS: "3600",
       NODE_ENV: "production",
       HOST: "::",
       PORT: "8080",

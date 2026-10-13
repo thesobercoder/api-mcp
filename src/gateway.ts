@@ -1,11 +1,12 @@
+import type { ValidateFunction } from 'ajv';
 import Ajv from 'ajv/dist/2020.js';
 import addFormats from 'ajv-formats';
 import { version } from '../package.json';
 import { CallError, ConfigError } from './errors';
 import { boundedBytes, encodeBody, pathValue, queryValue, simple } from './http';
-import { BAD_KEYS, resolve, schemaFor } from './openapi';
+import { resolve, schemaFor } from './openapi';
 import { applySecurity } from './security';
-import type { Api, ApiDefinition, Env, Fetcher, Limits, Log, Operation, Tool } from './types';
+import type { Api, ApiSource, Fetcher, Limits, Log, Operation, Parameter, Spec, Tool } from './types';
 
 export { CallError, ConfigError };
 
@@ -15,59 +16,86 @@ const IDEMPOTENT = new Set(['get', 'put', 'delete', 'head', 'options']);
 const PROTOCOLS = new Set(['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05']);
 const DEFAULT_PROTOCOL = '2025-03-26';
 const ROUTE = /^\/([a-z][a-z0-9_]*)\/mcp$/;
+const TRAILING_PARAM = /\/\{([^}/]+)\}$/;
 const USER_AGENT = `api-mcp/${version}`;
 const DEFAULT_INSTRUCTIONS = 'Tools come from this API OpenAPI specification. Authentication is managed by Bifrost. Tool annotations identify reads and writes.';
 const HEADERS = { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' };
 const decoder = new TextDecoder();
 
-export interface GatewayOptions extends Partial<Limits> {
-  env?: Env;
-  log?: Log;
-  fetcher?: Fetcher;
+const glob = (pattern: string) => new RegExp(`^${pattern.split('*').map(part => part.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*')}$`, 'i');
+const anyOf = (patterns: string[]) => (patterns.length ? new RegExp(patterns.map(p => glob(p).source).join('|'), 'i') : null);
+
+/** Filters match an operationId, `tag:<name>` or `path:<path>`; `*` is a wildcard. */
+function matcher(patterns: string[]) {
+  const ids = patterns.filter(p => !/^(tag|path):/.test(p)).map(glob);
+  const tags = patterns.filter(p => p.startsWith('tag:')).map(p => glob(p.slice(4)));
+  const paths = patterns.filter(p => p.startsWith('path:')).map(p => glob(p.slice(5)));
+  return (name: string, op: Spec, path: string) => ids.some(r => r.test(name)) || paths.some(r => r.test(path)) || (op.tags ?? []).some((t: string) => tags.some(r => r.test(t)));
 }
 
-function readHeader(value: unknown, env: Env): string {
-  if (value && typeof value === 'object' && Object.hasOwn(value, 'env')) {
-    const name = (value as { env: unknown }).env;
-    if (typeof name !== 'string' || !env[name]) throw new ConfigError('Missing configured environment variable.');
-    return env[name];
-  }
-  if (typeof value !== 'string') throw new ConfigError('Configured header values must be strings or environment references.');
-  return value;
-}
-
-function baseUrl(raw: unknown): URL {
+function baseUrl(source: ApiSource, spec: Spec): URL {
+  const server = spec.servers?.[0];
+  let raw: string | undefined = source.options.baseUrl ?? server?.url;
+  if (!raw) throw new ConfigError(`${source.name}: the OpenAPI document has no server URL; set API_${source.name.toUpperCase()}_BASE_URL.`);
+  if (!source.options.baseUrl) raw = raw.replace(/\{([^}]+)\}/g, (match, v: string) => server.variables?.[v]?.default ?? match);
   let url: URL;
-  try { url = new URL(String(raw)); } catch { throw new ConfigError('Invalid API base URL.'); }
-  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
-    throw new ConfigError('API base URLs must be HTTP(S), without credentials, queries or fragments.');
+  try { url = new URL(raw, source.url); } catch { throw new ConfigError(`${source.name}: invalid API base URL.`); }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash || /[{}]/.test(decodeURI(url.pathname))) {
+    throw new ConfigError(`${source.name}: the API base URL must be HTTP(S) without credentials, queries, fragments or template variables.`);
   }
   return url;
 }
 
-function compileApi(raw: ApiDefinition, env: Env, ajv: Ajv): Api {
-  const spec = raw.spec;
-  if (!/^3\.[01]\./.test(spec?.openapi ?? '')) throw new ConfigError('Supply a bundled OpenAPI 3.0 or 3.1 document.');
-  const headers = Object.entries(raw.headers ?? {}).map(([k, v]): [string, string] => [k, readHeader(v, env)]);
-  const headerNames = new Set(headers.map(([k]) => k.toLowerCase()));
-  const base = baseUrl(raw.baseUrl ?? spec.servers?.[0]?.url);
+function lazyValidator(ajv: Ajv, schema: Spec) {
+  let compiled: ValidateFunction | undefined;
+  return () => (compiled ??= ajv.compile(schema));
+}
+
+/** Turns a fetched OpenAPI document into MCP tools, applying the API's env-configured options. */
+export function compileApi(source: ApiSource, spec: Spec): Api {
+  if (!/^3\.[01]\./.test(spec?.openapi ?? '')) throw new ConfigError(`${source.name}: supply an OpenAPI 3.0 or 3.1 document.`);
+  const { options } = source;
+  const ajv = new Ajv({ strict: false, allErrors: true, useDefaults: true, validateFormats: true });
+  addFormats(ajv);
+  const included = options.include.length ? matcher(options.include) : () => true;
+  const excluded = matcher(options.exclude);
+  const fixedHeaders = new Set(options.headers.map(([k]) => k.toLowerCase()));
   const operations = new Map<string, Operation>(), tools: Tool[] = [];
+
   for (const [path, rawPath] of Object.entries(spec.paths ?? {})) {
-    if (!path.startsWith('/') || path.includes('?') || path.includes('#')) throw new ConfigError('OpenAPI paths must be absolute API paths.');
+    if (!path.startsWith('/') || path.includes('?') || path.includes('#')) throw new ConfigError(`${source.name}: OpenAPI paths must be absolute API paths.`);
     const pathItem = resolve(spec, rawPath);
-    for (const [method, op] of Object.entries<Record<string, unknown> & { [k: string]: any }>(pathItem)) {
+    for (const [method, op] of Object.entries<Spec>(pathItem)) {
       if (!METHODS.has(method)) continue;
-      const name: string = op['x-mcp-tool-name'] ?? op.operationId ?? `${method}_${path.replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_|_$/g, '')}`;
-      if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name) || operations.has(name)) throw new ConfigError('Tool names must be unique identifiers; set operationId or x-mcp-tool-name.');
+      const name: string = op.operationId ?? `${method}_${path.replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_|_$/g, '')}`;
+      if ((options.readOnly && !READ.has(method)) || (op.deprecated && !options.includeDeprecated)) continue;
+      if (!included(name, op, path) || excluded(name, op, path)) continue;
+      if (!/^[a-zA-Z_][a-zA-Z0-9_.-]{0,127}$/.test(name) || operations.has(name)) throw new ConfigError(`${source.name}: tool names must be unique identifiers (operationId ${JSON.stringify(name)}).`);
+      if (method === 'trace') continue;
       const plan = schemaFor(spec, op, pathItem);
-      for (const p of plan.parameters) {
-        if (p.in === 'header' && (p.name.toLowerCase() === 'authorization' || headerNames.has(p.name.toLowerCase()))) {
-          throw new ConfigError('Authentication headers belong in securitySchemes, not tool parameters.');
+      // Headers supplied by configuration or Bifrost are not tool arguments.
+      plan.parameters = plan.parameters.filter(p => {
+        if (p.in !== 'header') return true;
+        const lower = p.name.toLowerCase();
+        if (lower !== 'authorization' && !fixedHeaders.has(lower) && !options.forwardHeaders.includes(lower)) return true;
+        delete plan.inputSchema.properties[p.argument];
+        plan.inputSchema.required = plan.inputSchema.required.filter((r: string) => r !== p.argument);
+        return false;
+      });
+      if (plan.body && (method === 'get' || method === 'head')) continue;
+      const optionalTrailing: Parameter[] = [];
+      if (options.optionalTrailingPathParams) {
+        let rest = path;
+        for (let m = TRAILING_PARAM.exec(rest); m; m = TRAILING_PARAM.exec(rest)) {
+          const p = plan.parameters.find(x => x.in === 'path' && x.name === m?.[1]);
+          if (!p) break;
+          optionalTrailing.unshift(p);
+          rest = rest.slice(0, m.index);
         }
+        const optional = new Set(optionalTrailing.map(p => p.argument));
+        plan.inputSchema.required = plan.inputSchema.required.filter((r: string) => !optional.has(r));
       }
-      if (plan.body && (method === 'get' || method === 'head')) throw new ConfigError('GET/HEAD request bodies are not supported.');
-      // Compile validators up front so the first call is as fast as the rest.
-      operations.set(name, { name, path, method: method.toUpperCase(), security: op.security, parameters: plan.parameters, body: plan.body, validate: ajv.compile(plan.inputSchema) });
+      operations.set(name, { name, path, method: method.toUpperCase(), security: op.security, parameters: plan.parameters, optionalTrailing, body: plan.body, validator: lazyValidator(ajv, plan.inputSchema) });
       tools.push({
         name,
         description: op.description ?? op.summary ?? `${method.toUpperCase()} ${path}`,
@@ -76,49 +104,65 @@ function compileApi(raw: ApiDefinition, env: Env, ajv: Ajv): Api {
       });
     }
   }
-  if (!tools.length) throw new ConfigError('An API has no operations.');
-  const wrapHeaders = Object.entries(raw.responseHeaders ?? {});
+  if (!tools.length) throw new ConfigError(`${source.name}: no operations left after filtering.`);
+  const base = baseUrl(source, spec);
   return {
-    name: raw.name,
+    name: source.name,
     base,
     basePath: base.pathname.replace(/\/$/, ''),
-    headers,
-    forwardHeaders: raw.forwardHeaders ?? ['authorization'],
-    securityBindings: raw.securityBindings ?? {},
+    options,
+    responseHeaders: anyOf(options.responseHeaders),
     securitySchemes: spec.components?.securitySchemes ?? {},
     defaultSecurity: spec.security ?? [],
-    wrap: raw.wrapResponse || raw.responseHeaders ? { key: raw.responseHeadersKey ?? 'headers', headers: wrapHeaders } : null,
     operations,
     tools,
     toolsJson: JSON.stringify({ tools }),
-    instructions: raw.instructions ?? DEFAULT_INSTRUCTIONS,
+    instructions: options.instructions ?? DEFAULT_INSTRUCTIONS,
   };
 }
 
 /** Upstream result already serialised: `text` is valid JSON; `object` says whether it is a JSON object. */
 interface Payload { text: string; object: boolean }
 
-export function createGateway(input: { apis?: ApiDefinition[] }, options: GatewayOptions = {}) {
-  const env = options.env ?? process.env;
-  if (!input || !Array.isArray(input.apis) || !input.apis.length) throw new ConfigError('API_CONFIG must contain at least one API.');
+export interface GatewayOptions extends Partial<Limits> {
+  log?: Log;
+  fetcher?: Fetcher;
+}
+
+export interface ApiStatus { tools?: number; loaded_at?: string; error?: string }
+
+/** Serves MCP for whichever APIs are currently loaded; APIs can be swapped at runtime. */
+export function createGateway(configured: string[], options: GatewayOptions = {}) {
   const limits: Limits = { requestBytes: options.requestBytes ?? 1048576, responseBytes: options.responseBytes ?? 1048576, timeoutMs: options.timeoutMs ?? 20000 };
-  const ajv = new Ajv({ strict: false, allErrors: true, useDefaults: true, validateFormats: true });
-  addFormats(ajv);
   const services = new Map<string, Api>();
-  for (const raw of input.apis) {
-    if (typeof raw?.name !== 'string' || !/^[a-z][a-z0-9_]*$/.test(raw.name) || services.has(raw.name)) throw new ConfigError('API names must be unique lowercase identifiers.');
-    services.set(raw.name, compileApi(raw, env, ajv));
+  const status = new Map<string, ApiStatus>(configured.map(name => [name, { error: 'Not loaded yet.' }]));
+  let health = '';
+  let healthy = false;
+  const refreshHealth = () => {
+    healthy = configured.every(name => services.has(name));
+    health = JSON.stringify({ ok: healthy, version, apis: Object.fromEntries(status) });
+  };
+  refreshHealth();
+
+  function setApi(api: Api) {
+    services.set(api.name, api);
+    status.set(api.name, { tools: api.tools.length, loaded_at: new Date().toISOString() });
+    refreshHealth();
   }
-  const tools = Object.fromEntries([...services].map(([k, v]) => [k, v.operations.size]));
-  const healthJson = JSON.stringify({ ok: true, version, apis: [...services.keys()], tools });
+  /** Records a load failure; a previously loaded version keeps serving. */
+  function setError(name: string, message: string) {
+    status.set(name, { ...status.get(name), error: message });
+    refreshHealth();
+  }
 
   async function invoke(api: Api, name: unknown, args: unknown, request: Request, fetcher: Fetcher): Promise<Payload> {
     const op = typeof name === 'string' ? api.operations.get(name) : undefined;
     if (!op) throw new CallError('Unknown tool.');
     if (!args || typeof args !== 'object' || Array.isArray(args)) throw new CallError('Arguments must be an object.');
     // `args` is freshly parsed request JSON, so Ajv may apply defaults in place.
-    if (!op.validate(args)) {
-      const detail = (op.validate.errors ?? []).map(e => `${e.instancePath} ${e.message}`).join('; ').slice(0, 500);
+    const validate = op.validator();
+    if (!validate(args)) {
+      const detail = (validate.errors ?? []).map(e => `${e.instancePath} ${e.message}`).join('; ').slice(0, 500);
       throw new CallError(`Invalid arguments: ${detail}`);
     }
     const values = args as Record<string, unknown>;
@@ -126,8 +170,15 @@ export function createGateway(input: { apis?: ApiDefinition[] }, options: Gatewa
     const credentials = applySecurity(api, op, request, headers);
 
     let path = op.path;
-    for (const p of op.parameters) if (p.in === 'path') path = path.replaceAll(`{${p.name}}`, pathValue(p, values[p.argument]));
-    path = path.replace(/\/$/, '');
+    const firstOmitted = op.optionalTrailing.findIndex(p => values[p.argument] === undefined);
+    if (firstOmitted !== -1) {
+      const later = op.optionalTrailing.slice(firstOmitted).find(p => values[p.argument] !== undefined);
+      if (later) throw new CallError(`Provide ${op.optionalTrailing[firstOmitted]?.argument} when ${later.argument} is set.`);
+      for (const _ of op.optionalTrailing.slice(firstOmitted)) path = path.replace(TRAILING_PARAM, '');
+    }
+    for (const p of op.parameters) {
+      if (p.in === 'path' && values[p.argument] !== undefined) path = path.replaceAll(`{${p.name}}`, pathValue(p, values[p.argument]));
+    }
     if (/\{[^}]+\}/.test(path)) throw new CallError('Unresolved path parameter.');
     const url = new URL(api.base.origin + api.basePath + path);
     if (url.origin !== api.base.origin || (api.basePath && !url.pathname.startsWith(`${api.basePath}/`))) throw new CallError('Request would escape the configured API base.');
@@ -166,13 +217,13 @@ export function createGateway(input: { apis?: ApiDefinition[] }, options: Gatewa
       data = { text, object: !!parsed && typeof parsed === 'object' && !Array.isArray(parsed) };
     } else if (contentType.startsWith('text/')) data = { text: JSON.stringify({ text: decoder.decode(bytes), content_type: contentType }), object: true };
     else data = { text: JSON.stringify({ base64: Buffer.from(bytes).toString('base64'), content_type: contentType }), object: true };
-    if (!api.wrap) return data;
+
+    // Surface pagination-style response headers alongside the data.
+    if (!api.responseHeaders) return data;
     const extracted: Record<string, string> = {};
-    for (const [key, header] of api.wrap.headers) {
-      const value = response.headers.get(header);
-      if (value !== null) extracted[key] = value;
-    }
-    return { text: `{"data":${data.text},${JSON.stringify(api.wrap.key)}:${JSON.stringify(extracted)}}`, object: true };
+    for (const [key, value] of response.headers) if (api.responseHeaders.test(key)) extracted[key] = value;
+    if (!Object.keys(extracted).length) return data;
+    return { text: `{"data":${data.text},"headers":${JSON.stringify(extracted)}}`, object: true };
   }
 
   const respond = (body: string, status = 200) => new Response(body, { status, headers: HEADERS });
@@ -183,10 +234,11 @@ export function createGateway(input: { apis?: ApiDefinition[] }, options: Gatewa
 
   async function handler(request: Request, fetcher: Fetcher = options.fetcher ?? fetch): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname === '/health' && request.method === 'GET') return respond(healthJson);
+    if (url.pathname === '/health' && request.method === 'GET') return respond(health, healthy ? 200 : 503);
     const match = ROUTE.exec(url.pathname);
-    const api = match ? services.get(match[1] as string) : undefined;
-    if (!api) return json({ error: 'Unknown API endpoint.' }, 404);
+    const name = match?.[1];
+    const api = name ? services.get(name) : undefined;
+    if (!api) return name && status.has(name) ? json({ error: 'API is still loading.' }, 503) : json({ error: 'Unknown API endpoint.' }, 404);
     const origin = request.headers.get('origin');
     if (origin && origin !== url.origin) return json({ error: 'Cross-origin requests are not supported.' }, 403);
     if (request.method !== 'POST') return new Response(null, { status: 405, headers: { Allow: 'POST' } });
@@ -226,5 +278,5 @@ export function createGateway(input: { apis?: ApiDefinition[] }, options: Gatewa
     }
   }
 
-  return { handler, services, limits };
+  return { handler, services, limits, setApi, setError };
 }

@@ -1,94 +1,62 @@
 # api-mcp
 
-A private, stateless OpenAPI-to-MCP gateway for Bifrost. The engine has no service-specific routes. Each API supplies a bundled OpenAPI 3.0/3.1 document in configuration; every HTTP operation in that document becomes an MCP tool, including writes.
+A stateless gateway that turns OpenAPI documents into MCP servers **at runtime**. The image contains no API definitions. Give it a list of OpenAPI URLs; on startup it fetches each document and exposes every operation as an MCP tool. It re-fetches documents hourly, so API changes appear without a redeploy.
 
-## Add another API
+## Configure
 
-Add an entry to the `apis` array in `config/apis.json` (bundled into the image). `API_CONFIG` can override the whole file at runtime:
+Everything comes from environment variables.
 
-```json
-{
-  "name": "another_api",
-  "baseUrl": "https://api.example.com/v1",
-  "forwardHeaders": ["authorization"],
-  "spec": {
-    "openapi": "3.1.0",
-    "info": {"title": "Example", "version": "1"},
-    "paths": {
-      "/items": {
-        "get": {"operationId": "listItems", "responses": {"200": {"description": "Items"}}},
-        "post": {
-          "operationId": "createItem",
-          "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"title": {"type": "string"}}, "required": ["title"]}}}},
-          "responses": {"201": {"description": "Created"}}
-        }
-      }
-    }
-  }
-}
+```sh
+OPENAPI_SPECS=trakt=https://developer.trakt.tv/openapi.json,whoop=https://api.prod.whoop.com/developer/doc/openapi.json
 ```
 
-Configure that API's MCP connection in Bifrost at `http://api-mcp.railway.internal:8080/another_api/mcp`. OAuth endpoints/client configuration are set in Bifrost; the adapter only forwards credentials to the configured API. Pushing the change publishes a new image; setting `API_CONFIG` overrides it without a rebuild.
+Each `name=url` pair is served at `http://<host>:8080/<name>/mcp`. Names are lowercase identifiers. Documents can be JSON or YAML (OpenAPI 3.0/3.1). External `$ref`s are fetched and inlined.
 
-`config/apis.json` preserves the existing Trakt and WHOOP tool names and behavior. These are curated OpenAPI documents for the operations already connected; adding a fuller API document exposes its additional operations.
+### Per-API settings (all optional)
 
-## Configuration
+Set `API_<NAME>_<SETTING>`, for example `API_TRAKT_READ_ONLY=true`. Write `${VAR}` to pull a value from another variable, so secrets stay in their own variables.
 
-| Variable | Meaning |
+| Setting | Meaning |
 |---|---|
-| `API_CONFIG` | Optional JSON override for `config/apis.json` |
-| `TRAKT_CLIENT_ID` | Public Trakt app identifier referenced by the existing API configuration |
-| `HOST` | Listen address; production uses `::` for Railway private IPv6 networking |
-| `PORT` | Listen port; production uses `8080` |
-| `NODE_ENV` | Production uses `production` |
-| `LOG_LEVEL` | `info` or `silent` |
-| `MAX_REQUEST_BYTES` | Maximum JSON-RPC request size; default 1 MiB |
-| `MAX_RESPONSE_BYTES` | Maximum API response size; default 1 MiB |
-| `UPSTREAM_TIMEOUT_MS` | Per-request timeout; default 20 seconds |
+| `HEADERS` | JSON object of headers sent on every call, e.g. `{"trakt-api-key":"${TRAKT_CLIENT_ID}"}` |
+| `READ_ONLY` | `true` exposes only GET/HEAD/OPTIONS operations |
+| `INCLUDE` / `EXCLUDE` | Space/comma-separated filters: an operationId, `tag:<name>` or `path:<path>`; `*` is a wildcard |
+| `INCLUDE_DEPRECATED` | `true` keeps deprecated operations (dropped by default) |
+| `OPTIONAL_TRAILING_PATH_PARAMS` | `true` lets trailing `/{param}` segments be omitted (for APIs like Trakt) |
+| `BASE_URL` | Overrides the document's first server URL |
+| `FORWARD_HEADERS` | Incoming headers passed upstream; default `authorization` (Bifrost supplies OAuth tokens) |
+| `SECURITY_BINDINGS` | JSON mapping a security scheme to an incoming header, e.g. `{"key":{"sourceHeader":"x-api-key"}}` |
+| `RESPONSE_HEADERS` | Response headers returned with the data; default `x-pagination-* link x-total-count` |
+| `SPEC_HEADERS` | JSON headers used when fetching the document itself (private specs) |
+| `INSTRUCTIONS` | MCP server instructions |
 
-Secrets are not stored in the API definitions. Header values can reference an environment variable with `{"env":"NAME"}`. `securityBindings` can map a named API security scheme to an incoming Bifrost header. Optional `responseHeaders`, `responseHeadersKey`, and `wrapResponse` preserve APIs that paginate through response headers.
+When a response carries matching headers, the result is `{"data": ..., "headers": {...}}`; otherwise it is the API's JSON.
 
-## Supported request shapes
+### Service settings
 
-Path/query/header/cookie parameters; JSON, URL-encoded, multipart, text, and binary request bodies; JSON, text, binary, and no-content responses; local schema references, recursive objects, enums, defaults, date-time formats and OpenAPI nullable fields.
+| Variable | Default |
+|---|---|
+| `HOST` / `PORT` | `::` / `8080` |
+| `LOG_LEVEL` | `info` (`silent` disables) |
+| `MAX_REQUEST_BYTES` / `MAX_RESPONSE_BYTES` | 1 MiB |
+| `UPSTREAM_TIMEOUT_MS` | 20000 |
+| `SPEC_TIMEOUT_MS` / `MAX_SPEC_BYTES` | 30000 / 20 MiB |
+| `SPEC_REFRESH_SECONDS` | 3600 (`0` disables refresh) |
+| `SPEC_RETRY_SECONDS` | 30, for documents that failed to load |
 
-Schemas with external `$ref` URLs must first be bundled into one document. Parameter `content` schemas and nested `deepObject` query values are explicitly rejected. API server URLs with template variables must be resolved using `baseUrl`. GraphQL and SOAP need their own HTTP/OpenAPI descriptions or adapters.
+## Runtime behaviour
 
-`operationId` defines the tool name. `x-mcp-tool-name` overrides it; `x-mcp-argument-name` resolves parameter naming conflicts. The optional `x-mcp-omit-path-values` parameter extension supports optional path segments such as Trakt's unfiltered history endpoint.
+- The server starts immediately; documents load in the background.
+- `/health` returns 200 only when every listed API is loaded, and reports each API's tool count or error. Railway's health check therefore never replaces a working deployment with one that can't load its specs.
+- A failed refresh keeps serving the last good version. Unchanged documents (by SHA-256) are not recompiled.
+- Schemas are compiled and `tools/list` is serialised once per load. Upstream JSON is validated and passed through without re-serialising.
 
-## Deployment and twelve-factor design
+## Deploy
 
-- One version-controlled codebase with locked dependencies, built on the latest Bun (`oven/bun:latest`) and rebuilt weekly.
-- Shipped as a single compiled Bun binary (minified, bytecode) on distroless — no shell or package manager in the runtime image.
-- API definitions, hostnames, limits and credentials supplied through environment configuration.
-- Stateless processes; no local account/token/data storage or persistent volume.
-- Reproducible build artifact, release configuration and run phase are separate.
-- Port binding on private networking; scale replicas without sticky adapter sessions.
-- Health endpoint, bounded upstream timeouts, graceful shutdown and structured stdout logs.
-- Logs contain tool names, success state and duration; no request/response bodies or credentials.
-- Tests exercise an unrelated API's reads and writes as well as compatibility with the existing APIs.
+GitHub Actions (`.github/workflows/image.yml`) builds on the latest Bun (`oven/bun:latest`) on every push and weekly. Tests and type checks run inside the build. It publishes one compiled binary on distroless as `ghcr.io/thesobercoder/api-mcp` (`latest` and `sha-<commit>`), labelled with `org.opencontainers.image.source`. It then points the Railway service at that commit's image and deploys it. Deploying needs the `RAILWAY_TOKEN` secret plus `RAILWAY_SERVICE_ID` and `RAILWAY_ENVIRONMENT_ID` variables.
 
-Railway has no public domain or TCP proxy for this service. Bifrost connects over the same project's private network. Bifrost's public, authenticated MCP gateway remains the agent-facing entry point.
-
-GitHub Actions (`.github/workflows/image.yml`) tests, builds and publishes `ghcr.io/thesobercoder/api-mcp` (tags `latest` and `sha-<commit>`), then points the Railway service at the commit's image and deploys it. The image carries `org.opencontainers.image.source`, linking it back to this repository. Deploying needs the `RAILWAY_TOKEN` secret plus `RAILWAY_SERVICE_ID` and `RAILWAY_ENVIRONMENT_ID` variables. Other Railway settings live in `.railway/railway.ts` (`railway config plan` / `apply`). Existing API definitions and account identifiers are preserved on Railway. OAuth tokens remain in Bifrost.
-
-## Live verification
-
-Deployed on 13 October 2026 as version 1.0.0. The existing `trakt` and `whoop` client IDs and OAuth records were retained, with their upstream addresses read from Bifrost environment variables. Authenticated Trakt profile/history/watchlist and WHOOP profile/recovery/sleep passed after removing the public adapter domain. Temporary maintenance services and verification keys were deleted.
-
-The adapter uses roughly 19 MB RAM in an initial Railway sample after these calls; this is a point-in-time measurement, not a sustained-load benchmark. Private networking avoids public routing for Bifrost-to-adapter traffic. Calls from the adapter to external APIs still use internet networking.
-
-## Performance
-
-Tool schemas are compiled and `tools/list`/`health` responses serialised once at startup. Upstream JSON is validated and passed through without re-serialising. Local benchmark (same mock upstream, 32 concurrent clients, native arm64) against 1.0.0:
-
-| | 1.0.0 (Bun 1.4.0) | 1.1.0 (Bun 1.4.3, compiled) |
-|---|---|---|
-| `tools/list` | 23.4k req/s, p99 3.1 ms | 66.5k req/s, p99 1.4 ms |
-| `tools/call` (300-item response) | 2.1k req/s, p99 30.9 ms | 4.9k req/s, p99 13.5 ms |
-| Memory after load | 67 MB | 29 MB |
-| Image size | 207 MB | 115 MB |
+Railway settings and variables live in `.railway/railway.ts` (`railway config plan` / `apply`). The service has no public domain; Bifrost reaches it at `http://api-mcp.railway.internal:8080/<name>/mcp` and handles OAuth.
 
 ## Development
 
-TypeScript in `src/`, run directly by Bun. `bun install`, `bun test`, `bun run typecheck`, then `bun start`. `/health` reports the version, API names and tool counts.
+TypeScript in `src/`, run directly by Bun: `bun install`, `bun test`, `bun run typecheck`, then `bun start` with `OPENAPI_SPECS` set. Tests use the real Trakt and WHOOP documents from `test/fixtures/`.

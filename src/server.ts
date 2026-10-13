@@ -1,10 +1,11 @@
-import bundledConfig from '../config/apis.json';
 import { version } from '../package.json';
+import { readSources } from './config';
 import { createGateway } from './gateway';
+import { startRuntime } from './runtime';
 
-function positive(name: string, fallback: number): number {
+function number(name: string, fallback: number, min = 1): number {
   const value = Number(Bun.env[name] ?? fallback);
-  if (!Number.isSafeInteger(value) || value < 1) throw new Error(`Invalid numeric environment configuration: ${name}`);
+  if (!Number.isSafeInteger(value) || value < min) throw new Error(`Invalid numeric environment configuration: ${name}`);
   return value;
 }
 
@@ -13,31 +14,39 @@ const log = (event: Record<string, unknown>) => {
   if (!silent) console.log(JSON.stringify({ time: new Date().toISOString(), ...event }));
 };
 
-// API definitions ship in the image; API_CONFIG can override them without a rebuild.
-const config = Bun.env.API_CONFIG ? JSON.parse(Bun.env.API_CONFIG) : bundledConfig;
-const gateway = createGateway(config, {
-  env: Bun.env,
-  requestBytes: positive('MAX_REQUEST_BYTES', 1048576),
-  responseBytes: positive('MAX_RESPONSE_BYTES', 1048576),
-  timeoutMs: positive('UPSTREAM_TIMEOUT_MS', 20000),
+// Nothing about the APIs is baked into the image: OPENAPI_SPECS lists them, API_<NAME>_* tunes each one.
+const sources = readSources(Bun.env);
+const gateway = createGateway(sources.map(s => s.name), {
+  requestBytes: number('MAX_REQUEST_BYTES', 1048576),
+  responseBytes: number('MAX_RESPONSE_BYTES', 1048576),
+  timeoutMs: number('UPSTREAM_TIMEOUT_MS', 20000),
   log,
 });
 
 let ready = true;
 const server = Bun.serve({
   hostname: Bun.env.HOST ?? '::',
-  port: positive('PORT', 8080),
+  port: number('PORT', 8080),
   maxRequestBodySize: gateway.limits.requestBytes,
   idleTimeout: 30,
   fetch: request => (ready ? gateway.handler(request) : new Response('Shutting down', { status: 503 })),
 });
-log({ event: 'started', service: 'api-mcp', version, bun: Bun.version, port: server.port, apis: [...gateway.services.keys()] });
+log({ event: 'started', service: 'api-mcp', version, bun: Bun.version, port: server.port, apis: sources.map(s => s.name) });
+
+const runtime = startRuntime(gateway, sources, {
+  log,
+  timeoutMs: number('SPEC_TIMEOUT_MS', 30000),
+  maxSpecBytes: number('MAX_SPEC_BYTES', 20 * 1048576),
+  refreshMs: number('SPEC_REFRESH_SECONDS', 3600, 0) * 1000,
+  retryMs: number('SPEC_RETRY_SECONDS', 30) * 1000,
+});
 
 let stopping = false;
 async function shutdown() {
   if (stopping) return;
   stopping = true;
   ready = false;
+  runtime.stop();
   log({ event: 'stopping', service: 'api-mcp' });
   setTimeout(() => process.exit(1), 25000).unref();
   await server.stop(false);
