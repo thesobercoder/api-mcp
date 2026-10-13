@@ -69,6 +69,14 @@ Schemas with external `$ref` URLs must first be bundled into one document. Param
 
 Railway has no public domain or TCP proxy for this service. Bifrost connects over the same project's private network. Bifrost's public, authenticated MCP gateway remains the agent-facing entry point.
 
+Railway deployment settings are maintained in `.railway/railway.ts`, scoped to the `api-mcp` partial. This repository manages only the adapter. Run `railway config plan` to review and `railway config apply` to apply deployment settings; upload code with `railway up`. Existing API definitions and account identifiers are preserved on Railway. OAuth tokens remain in Bifrost.
+
+## Live verification
+
+Deployed on 13 October 2026 as version 1.0.0. The existing `trakt` and `whoop` client IDs and OAuth records were retained, with their upstream addresses read from Bifrost environment variables. Authenticated Trakt profile/history/watchlist and WHOOP profile/recovery/sleep passed after removing the public adapter domain. Temporary maintenance services and verification keys were deleted.
+
+The adapter uses roughly 19 MB RAM in an initial Railway sample after these calls; this is a point-in-time measurement, not a sustained-load benchmark. Private networking avoids public routing for Bifrost-to-adapter traffic. Calls from the adapter to external APIs still use internet networking.
+
 ## Development
 
 Use the pinned Bun runtime and `bun install --frozen-lockfile`. Run `bun test test/engine.test.mjs`; the pure engine tests also support `npm test`. Set the environment variables above to run `bun src/server.mjs`. `/health` reports configured API names and tool counts.

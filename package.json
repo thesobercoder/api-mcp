@@ -3,6 +3,15 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "scripts": { "start": "bun src/server.mjs", "test": "node --test test/*.test.mjs" },
-  "dependencies": { "ajv": "8.20.0", "ajv-formats": "3.0.1" }
+  "scripts": {
+    "start": "bun src/server.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1"
+  },
+  "devDependencies": {
+    "railway": "3.13.0"
+  }
 }
