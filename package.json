@@ -1,20 +1,9 @@
 {
   "name": "api-mcp",
-  "version": "2.0.0",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "bun src/server.ts",
-    "test": "bun test",
-    "typecheck": "tsc --noEmit",
-    "build": "bun build src/server.ts --compile --minify --sourcemap --bytecode --outfile dist/api-mcp"
-  },
-  "dependencies": {
-    "ajv": "8.20.0",
-    "ajv-formats": "3.0.1"
-  },
-  "devDependencies": {
-    "@types/bun": "latest",
-    "typescript": "latest"
+    "test": "bun test"
   }
 }

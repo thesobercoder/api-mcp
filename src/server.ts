@@ -1,56 +1,120 @@
-import { version } from '../package.json';
-import { readSources } from './config';
-import { createGateway } from './gateway';
-import { startRuntime } from './runtime';
+// Serves each OpenAPI document listed in OPENAPI_SPECS ("name=url,...") as an MCP server at /<name>/mcp.
+// Bifrost handles sign-in, API keys and tool filtering; this only translates MCP tool calls into HTTP requests.
 
-function number(name: string, fallback: number, min = 1): number {
-  const value = Number(Bun.env[name] ?? fallback);
-  if (!Number.isSafeInteger(value) || value < min) throw new Error(`Invalid numeric environment configuration: ${name}`);
-  return value;
+type Json = any;
+interface Op { method: string; path: string; params: { name: string; in: string }[] }
+export interface Api { base: string; forward: string[]; tools: Json[]; ops: Map<string, Op> }
+
+const METHODS = ['get', 'put', 'post', 'delete', 'patch', 'head', 'options'];
+const READ = ['get', 'head', 'options'];
+
+/** Inlines local `#/...` references so every tool schema is self-contained. */
+function deref(doc: Json, node: Json, seen: string[] = []): Json {
+  if (Array.isArray(node)) return node.map(n => deref(doc, n, seen));
+  if (!node || typeof node !== 'object') return node;
+  if (typeof node.$ref === 'string' && node.$ref.startsWith('#/')) {
+    if (seen.includes(node.$ref)) return {}; // recursive schema: stop expanding
+    const target = node.$ref.slice(2).split('/').reduce((o: Json, k: string) => o?.[k.replace(/~1/g, '/').replace(/~0/g, '~')], doc);
+    return deref(doc, target, [...seen, node.$ref]);
+  }
+  return Object.fromEntries(Object.entries(node).map(([k, v]) => [k, deref(doc, v, seen)]));
 }
 
-const silent = Bun.env.LOG_LEVEL === 'silent';
-const log = (event: Record<string, unknown>) => {
-  if (!silent) console.log(JSON.stringify({ time: new Date().toISOString(), ...event }));
-};
-
-// Nothing about the APIs is baked into the image: OPENAPI_SPECS lists them, API_<NAME>_* tunes each one.
-const sources = readSources(Bun.env);
-const gateway = createGateway(sources.map(s => s.name), {
-  requestBytes: number('MAX_REQUEST_BYTES', 1048576),
-  responseBytes: number('MAX_RESPONSE_BYTES', 1048576),
-  timeoutMs: number('UPSTREAM_TIMEOUT_MS', 20000),
-  log,
-});
-
-let ready = true;
-const server = Bun.serve({
-  hostname: Bun.env.HOST ?? '::',
-  port: number('PORT', 8080),
-  maxRequestBodySize: gateway.limits.requestBytes,
-  idleTimeout: 30,
-  fetch: request => (ready ? gateway.handler(request) : new Response('Shutting down', { status: 503 })),
-});
-log({ event: 'started', service: 'api-mcp', version, bun: Bun.version, port: server.port, apis: sources.map(s => s.name) });
-
-const runtime = startRuntime(gateway, sources, {
-  log,
-  timeoutMs: number('SPEC_TIMEOUT_MS', 30000),
-  maxSpecBytes: number('MAX_SPEC_BYTES', 20 * 1048576),
-  refreshMs: number('SPEC_REFRESH_SECONDS', 3600, 0) * 1000,
-  retryMs: number('SPEC_RETRY_SECONDS', 30) * 1000,
-});
-
-let stopping = false;
-async function shutdown() {
-  if (stopping) return;
-  stopping = true;
-  ready = false;
-  runtime.stop();
-  log({ event: 'stopping', service: 'api-mcp' });
-  setTimeout(() => process.exit(1), 25000).unref();
-  await server.stop(false);
-  process.exit(0);
+export function compile(doc: Json, specUrl: string): Api {
+  const server = doc.servers?.[0];
+  const base = new URL((server?.url ?? '/').replace(/\{(\w+)\}/g, (_: string, v: string) => server.variables?.[v]?.default ?? ''), specUrl).href.replace(/\/$/, '');
+  // Pass on the caller's Authorization plus any API-key headers the document declares (e.g. trakt-api-key).
+  const schemes = Object.values<Json>(doc.components?.securitySchemes ?? {});
+  const forward = ['authorization', ...schemes.filter(s => s.type === 'apiKey' && s.in === 'header').map(s => s.name.toLowerCase())];
+  const tools: Json[] = [], ops = new Map<string, Op>();
+  for (const [path, item] of Object.entries<Json>(doc.paths ?? {})) {
+    for (const method of METHODS) {
+      const op = item[method];
+      if (!op) continue;
+      const name = (op.operationId ?? `${method}_${path}`).replace(/[^a-zA-Z0-9_]+/g, '_');
+      const params = deref(doc, [...(item.parameters ?? []), ...(op.parameters ?? [])]);
+      const properties: Json = {}, required: string[] = [];
+      for (const p of params) {
+        properties[p.name] = { ...p.schema, description: p.description };
+        if (p.required || p.in === 'path') required.push(p.name);
+      }
+      const body = deref(doc, op.requestBody);
+      if (body) {
+        properties.body = Object.values<Json>(body.content ?? {})[0]?.schema ?? {};
+        if (body.required) required.push('body');
+      }
+      ops.set(name, { method: method.toUpperCase(), path, params });
+      tools.push({
+        name,
+        description: [op.summary, op.description].filter(Boolean).join('\n\n') || `${method.toUpperCase()} ${path}`,
+        inputSchema: { type: 'object', properties, required },
+        annotations: { readOnlyHint: READ.includes(method), destructiveHint: !READ.includes(method) },
+      });
+    }
+  }
+  return { base, forward, tools, ops };
 }
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
+
+async function call(api: Api, name: string, args: Json, incoming: Headers): Promise<{ text: string; isError: boolean }> {
+  const op = api.ops.get(name);
+  if (!op) return { text: `Unknown tool: ${name}`, isError: true };
+  const path = op.path.replace(/\{([^}]+)\}/g, (_, key: string) => {
+    const value = String(args[key] ?? '');
+    if (!value || value === '.' || value === '..') throw new Error(`Missing or invalid path parameter: ${key}`);
+    return encodeURIComponent(value);
+  });
+  const url = new URL(api.base + path);
+  const headers = new Headers({ accept: 'application/json' });
+  for (const h of api.forward) if (incoming.has(h)) headers.set(h, incoming.get(h) as string);
+  for (const p of op.params) {
+    const value = args[p.name];
+    if (value === undefined || p.in === 'path') continue;
+    if (p.in === 'query') for (const v of [value].flat()) url.searchParams.append(p.name, String(v));
+    if (p.in === 'header') headers.set(p.name, String(value));
+  }
+  if (args.body !== undefined) headers.set('content-type', 'application/json');
+  const response = await fetch(url, {
+    method: op.method, headers, redirect: 'error', signal: AbortSignal.timeout(30_000),
+    body: args.body === undefined ? undefined : JSON.stringify(args.body),
+  });
+  const text = await response.text();
+  return response.ok ? { text: text || `HTTP ${response.status}`, isError: false } : { text: `HTTP ${response.status}: ${text.slice(0, 1000)}`, isError: true };
+}
+
+/** Handles MCP JSON-RPC over plain HTTP POST (stateless Streamable HTTP). */
+export async function handle(apis: Map<string, Api>, request: Request): Promise<Response> {
+  const { pathname } = new URL(request.url);
+  if (pathname === '/health') return new Response('ok');
+  const api = apis.get(pathname.match(/^\/(\w+)\/mcp$/)?.[1] ?? '');
+  if (!api) return new Response('Not found', { status: 404 });
+  if (request.method !== 'POST') return new Response(null, { status: 405 });
+  const { id, method, params = {} } = await request.json().catch(() => ({}));
+  if (id === undefined) return new Response(null, { status: 202 }); // notification
+  const reply = (result: Json) => Response.json({ jsonrpc: '2.0', id, result });
+  switch (method) {
+    case 'initialize':
+      return reply({ protocolVersion: params.protocolVersion ?? '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'api-mcp', version: '3.0.0' } });
+    case 'ping': return reply({});
+    case 'tools/list': return reply({ tools: api.tools });
+    case 'tools/call': {
+      const result = await call(api, params.name, params.arguments ?? {}, request.headers).catch((e: Error) => ({ text: e.message, isError: true }));
+      return reply({ content: [{ type: 'text', text: result.text }], isError: result.isError });
+    }
+    default: return Response.json({ jsonrpc: '2.0', id, error: { code: -32601, message: `Unknown method: ${method}` } });
+  }
+}
+
+async function load(url: string): Promise<Json> {
+  const response = await fetch(url, { signal: AbortSignal.timeout(30_000) });
+  if (!response.ok) throw new Error(`${url} returned HTTP ${response.status}`);
+  const text = await response.text();
+  try { return JSON.parse(text); } catch { return Bun.YAML.parse(text); }
+}
+
+if (import.meta.main) {
+  const entries = (Bun.env.OPENAPI_SPECS ?? '').split(/[\s,]+/).filter(Boolean).map(e => e.split(/=(.*)/s));
+  if (!entries.length) throw new Error('Set OPENAPI_SPECS to name=url pairs.');
+  const apis = new Map(await Promise.all(entries.map(async ([name, url]) => [name, compile(await load(url as string), url as string)] as [string, Api])));
+  Bun.serve({ hostname: '::', port: Number(Bun.env.PORT ?? 8080), fetch: request => handle(apis, request) });
+  console.log(JSON.stringify({ event: 'started', bun: Bun.version, tools: Object.fromEntries([...apis].map(([n, a]) => [n, a.tools.length])) }));
+}
