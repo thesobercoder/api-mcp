@@ -1,6 +1,5 @@
 .git
 .github
-.railway
 node_modules
 dist
 .env*

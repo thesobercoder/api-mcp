@@ -55,7 +55,7 @@ When a response carries matching headers, the result is `{"data": ..., "headers"
 
 The Railway service is connected to this repository and deploys every push to `main`. Railway builds the `Dockerfile` on the latest Bun (`oven/bun:latest`), so each deploy picks up the newest Bun release. Tests and type checks run inside the build, so a failing change never deploys. The result is one compiled binary on distroless.
 
-Railway settings and variables live in `.railway/railway.ts` (`railway config plan` / `apply`). The service has no public domain; Bifrost reaches it at `http://api-mcp.railway.internal:8080/<name>/mcp` and handles OAuth.
+Railway auto-detects the `Dockerfile`; the health check (`/health`) and variables are set on the service. The service has no public domain; Bifrost reaches it at `http://api-mcp.railway.internal:8080/<name>/mcp` and handles OAuth.
 
 ## Development
 
