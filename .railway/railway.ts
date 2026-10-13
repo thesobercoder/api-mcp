@@ -1,4 +1,4 @@
-import { defineRailway, image, preserve, project, service } from "railway/iac";
+import { defineRailway, github, preserve, project, service } from "railway/iac";
 
 // This repository manages only its own resources in the environment.
 // See https://docs.railway.com/infrastructure-as-code#multi-repo-projects
@@ -6,8 +6,9 @@ export const partial = "api-mcp";
 
 export default defineRailway(() => {
   const api_mcp = service("api-mcp", {
-    // CI publishes the image and pins each deploy to its commit tag.
-    source: image("ghcr.io/thesobercoder/api-mcp:latest"),
+    // Railway builds the Dockerfile and deploys on every push to main.
+    source: github("thesobercoder/api-mcp", { branch: "main" }),
+    build: { builder: "DOCKERFILE", dockerfilePath: "Dockerfile" },
     healthcheck: "/health",
     healthcheckTimeout: 60,
     deploy: {

@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# Always build on the newest Bun release; CI rebuilds weekly to pick up updates.
+# Always build on the newest Bun release; every Railway deploy picks up updates.
 FROM oven/bun:latest AS build
 WORKDIR /app
 COPY package.json bun.lock ./

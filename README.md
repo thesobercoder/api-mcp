@@ -53,7 +53,7 @@ When a response carries matching headers, the result is `{"data": ..., "headers"
 
 ## Deploy
 
-GitHub Actions (`.github/workflows/image.yml`) builds on the latest Bun (`oven/bun:latest`) on every push and weekly. Tests and type checks run inside the build. It publishes one compiled binary on distroless as `ghcr.io/thesobercoder/api-mcp` (`latest` and `sha-<commit>`), labelled with `org.opencontainers.image.source`. It then points the Railway service at that commit's image and deploys it. Deploying needs the `RAILWAY_TOKEN` secret plus `RAILWAY_SERVICE_ID` and `RAILWAY_ENVIRONMENT_ID` variables.
+The Railway service is connected to this repository and deploys every push to `main`. Railway builds the `Dockerfile` on the latest Bun (`oven/bun:latest`), so each deploy picks up the newest Bun release. Tests and type checks run inside the build, so a failing change never deploys. The result is one compiled binary on distroless.
 
 Railway settings and variables live in `.railway/railway.ts` (`railway config plan` / `apply`). The service has no public domain; Bifrost reaches it at `http://api-mcp.railway.internal:8080/<name>/mcp` and handles OAuth.
 
