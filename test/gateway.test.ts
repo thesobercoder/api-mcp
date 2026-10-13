@@ -1,9 +1,9 @@
-import test from 'node:test';
+// @ts-nocheck -- compact fixtures; behaviour is what's under test.
+import { test } from 'bun:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { createGateway, ConfigError } from '../src/engine.mjs';
+import providers from '../config/apis.json';
+import { ConfigError, createGateway } from '../src/gateway';
 
-const providers = JSON.parse(readFileSync(new URL('../config/apis.json', import.meta.url)));
 const rpcRequest = (api, method, params = {}, headers = {}) => new Request(`http://api-mcp.internal/${api}/mcp`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) });
 async function call(gateway, api, name, args = {}, headers = {}, fetcher) {
   return (await (await gateway.handler(rpcRequest(api, 'tools/call', { name, arguments: args }, headers), fetcher)).json()).result;
@@ -44,6 +44,7 @@ test('existing provider tool names, default arguments, routes and pagination rem
   });
   assert.equal(reply.isError,false);
   assert.deepEqual(reply.structuredContent,{data:[{id:1}],pagination:{pages:'2'}});
+  assert.deepEqual(JSON.parse(reply.content[0].text),reply.structuredContent);
 });
 test('public search requires only the app key; private tools never call APIs without OAuth', async () => {
   const gateway = createGateway(providers,{env:{TRAKT_CLIENT_ID:'public-key'}});

@@ -1,16 +1,15 @@
-import { defineRailway, preserve, project, service } from "railway/iac";
+import { defineRailway, image, preserve, project, service } from "railway/iac";
 
-// This repository manages only its own resources in the environment. Other
-// repositories export their own partial name.
+// This repository manages only its own resources in the environment.
 // See https://docs.railway.com/infrastructure-as-code#multi-repo-projects
 export const partial = "api-mcp";
 
 export default defineRailway(() => {
   const api_mcp = service("api-mcp", {
-    start: "bun src/server.mjs",
+    // CI publishes the image and pins each deploy to its commit tag.
+    source: image("ghcr.io/thesobercoder/api-mcp:latest"),
     healthcheck: "/health",
     healthcheckTimeout: 60,
-    build: { builder: "DOCKERFILE", dockerfilePath: "Dockerfile" },
     deploy: {
       // Railway stores its default ON_FAILURE policy as null.
       restartPolicyType: null,
@@ -20,7 +19,6 @@ export default defineRailway(() => {
     },
     // No public domains or TCP proxies. Private DNS uses the service name.
     env: {
-      API_CONFIG: preserve(),
       TRAKT_CLIENT_ID: preserve(),
       NODE_ENV: "production",
       HOST: "::",

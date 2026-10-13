@@ -4,7 +4,7 @@ A private, stateless OpenAPI-to-MCP gateway for Bifrost. The engine has no servi
 
 ## Add another API
 
-Add an entry to the `apis` array in the `API_CONFIG` environment variable:
+Add an entry to the `apis` array in `config/apis.json` (bundled into the image). `API_CONFIG` can override the whole file at runtime:
 
 ```json
 {
@@ -28,7 +28,7 @@ Add an entry to the `apis` array in the `API_CONFIG` environment variable:
 }
 ```
 
-Configure that API's MCP connection in Bifrost at `http://api-mcp.railway.internal:8080/another_api/mcp`. OAuth endpoints/client configuration are set in Bifrost; the adapter only forwards credentials to the configured API. Changing `API_CONFIG` creates a new release without editing/rebuilding the engine.
+Configure that API's MCP connection in Bifrost at `http://api-mcp.railway.internal:8080/another_api/mcp`. OAuth endpoints/client configuration are set in Bifrost; the adapter only forwards credentials to the configured API. Pushing the change publishes a new image; setting `API_CONFIG` overrides it without a rebuild.
 
 `config/apis.json` preserves the existing Trakt and WHOOP tool names and behavior. These are curated OpenAPI documents for the operations already connected; adding a fuller API document exposes its additional operations.
 
@@ -36,7 +36,7 @@ Configure that API's MCP connection in Bifrost at `http://api-mcp.railway.intern
 
 | Variable | Meaning |
 |---|---|
-| `API_CONFIG` | Required JSON API definitions; not embedded in application code |
+| `API_CONFIG` | Optional JSON override for `config/apis.json` |
 | `TRAKT_CLIENT_ID` | Public Trakt app identifier referenced by the existing API configuration |
 | `HOST` | Listen address; production uses `::` for Railway private IPv6 networking |
 | `PORT` | Listen port; production uses `8080` |
@@ -58,7 +58,8 @@ Schemas with external `$ref` URLs must first be bundled into one document. Param
 
 ## Deployment and twelve-factor design
 
-- One version-controlled codebase, with locked dependencies and a pinned Bun 1.4.0 Docker runtime.
+- One version-controlled codebase with locked dependencies, built on the latest Bun (`oven/bun:latest`) and rebuilt weekly.
+- Shipped as a single compiled Bun binary (minified, bytecode) on distroless — no shell or package manager in the runtime image.
 - API definitions, hostnames, limits and credentials supplied through environment configuration.
 - Stateless processes; no local account/token/data storage or persistent volume.
 - Reproducible build artifact, release configuration and run phase are separate.
@@ -69,7 +70,7 @@ Schemas with external `$ref` URLs must first be bundled into one document. Param
 
 Railway has no public domain or TCP proxy for this service. Bifrost connects over the same project's private network. Bifrost's public, authenticated MCP gateway remains the agent-facing entry point.
 
-Railway deployment settings are maintained in `.railway/railway.ts`, scoped to the `api-mcp` partial. This repository manages only the adapter. Run `railway config plan` to review and `railway config apply` to apply deployment settings; upload code with `railway up`. Existing API definitions and account identifiers are preserved on Railway. OAuth tokens remain in Bifrost.
+GitHub Actions (`.github/workflows/image.yml`) tests, builds and publishes `ghcr.io/thesobercoder/api-mcp` (tags `latest` and `sha-<commit>`), then points the Railway service at the commit's image and deploys it. The image carries `org.opencontainers.image.source`, linking it back to this repository. Deploying needs the `RAILWAY_TOKEN` secret plus `RAILWAY_SERVICE_ID` and `RAILWAY_ENVIRONMENT_ID` variables. Other Railway settings live in `.railway/railway.ts` (`railway config plan` / `apply`). Existing API definitions and account identifiers are preserved on Railway. OAuth tokens remain in Bifrost.
 
 ## Live verification
 
@@ -77,6 +78,17 @@ Deployed on 13 October 2026 as version 1.0.0. The existing `trakt` and `whoop` c
 
 The adapter uses roughly 19 MB RAM in an initial Railway sample after these calls; this is a point-in-time measurement, not a sustained-load benchmark. Private networking avoids public routing for Bifrost-to-adapter traffic. Calls from the adapter to external APIs still use internet networking.
 
+## Performance
+
+Tool schemas are compiled and `tools/list`/`health` responses serialised once at startup. Upstream JSON is validated and passed through without re-serialising. Local benchmark (same mock upstream, 32 concurrent clients, native arm64) against 1.0.0:
+
+| | 1.0.0 (Bun 1.4.0) | 1.1.0 (Bun 1.4.3, compiled) |
+|---|---|---|
+| `tools/list` | 23.4k req/s, p99 3.1 ms | 66.5k req/s, p99 1.4 ms |
+| `tools/call` (300-item response) | 2.1k req/s, p99 30.9 ms | 4.9k req/s, p99 13.5 ms |
+| Memory after load | 67 MB | 29 MB |
+| Image size | 207 MB | 115 MB |
+
 ## Development
 
-Use the pinned Bun runtime and `bun install --frozen-lockfile`. Run `bun test test/engine.test.mjs`; the pure engine tests also support `npm test`. Set the environment variables above to run `bun src/server.mjs`. `/health` reports configured API names and tool counts.
+TypeScript in `src/`, run directly by Bun. `bun install`, `bun test`, `bun run typecheck`, then `bun start`. `/health` reports the version, API names and tool counts.
