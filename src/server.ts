@@ -1,5 +1,6 @@
-// Serves each OpenAPI document listed in OPENAPI_SPECS ("name=url,...") as an MCP server at /<name>/mcp.
-// Bifrost handles sign-in, API keys and tool filtering; this only translates MCP tool calls into HTTP requests.
+// Serves any OpenAPI document as an MCP server: POST /mcp?spec=<https URL of the document>.
+// No configuration. Bifrost handles sign-in, API keys and tool filtering; this only turns MCP tool calls into HTTP requests.
+// It fetches whatever spec URL it is given, so keep it on a private network.
 
 type Json = any;
 interface Op { method: string; path: string; params: { name: string; in: string }[] }
@@ -81,30 +82,47 @@ async function call(api: Api, name: string, args: Json, incoming: Headers): Prom
   return response.ok ? { text: text || `HTTP ${response.status}`, isError: false } : { text: `HTTP ${response.status}: ${text.slice(0, 1000)}`, isError: true };
 }
 
+const cache = new Map<string, Promise<Api>>();
+
+/** Loads and compiles a spec once per process; failures are retried on the next request. */
+function api(spec: string): Promise<Api> {
+  let entry = cache.get(spec);
+  if (!entry) {
+    entry = load(spec).then(doc => compile(doc, spec));
+    entry.catch(() => cache.delete(spec));
+    cache.set(spec, entry);
+  }
+  return entry;
+}
+
 /** Handles MCP JSON-RPC over plain HTTP POST (stateless Streamable HTTP). */
-export async function handle(apis: Map<string, Api>, request: Request): Promise<Response> {
-  const { pathname } = new URL(request.url);
-  if (pathname === '/health') return new Response('ok');
-  const api = apis.get(pathname.match(/^\/(\w+)\/mcp$/)?.[1] ?? '');
-  if (!api) return new Response('Not found', { status: 404 });
+export async function handle(request: Request): Promise<Response> {
+  const url = new URL(request.url);
+  if (url.pathname === '/health') return new Response('ok');
+  if (url.pathname !== '/mcp') return new Response('Not found', { status: 404 });
   if (request.method !== 'POST') return new Response(null, { status: 405 });
+  const spec = url.searchParams.get('spec') ?? '';
+  if (!spec.startsWith('https://')) return new Response('Add ?spec=<https URL of an OpenAPI document>', { status: 400 });
   const { id, method, params = {} } = await request.json().catch(() => ({}));
   if (id === undefined) return new Response(null, { status: 202 }); // notification
   const reply = (result: Json) => Response.json({ jsonrpc: '2.0', id, result });
+  const fail = (message: string) => Response.json({ jsonrpc: '2.0', id, error: { code: -32603, message } });
+  let target: Api;
+  try { target = await api(spec); } catch (e) { return fail(`Could not load the OpenAPI document: ${(e as Error).message}`); }
   switch (method) {
     case 'initialize':
-      return reply({ protocolVersion: params.protocolVersion ?? '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'api-mcp', version: '3.0.0' } });
+      return reply({ protocolVersion: params.protocolVersion ?? '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'api-mcp', version: '4.0.0' } });
     case 'ping': return reply({});
-    case 'tools/list': return reply({ tools: api.tools });
+    case 'tools/list': return reply({ tools: target.tools });
     case 'tools/call': {
-      const result = await call(api, params.name, params.arguments ?? {}, request.headers).catch((e: Error) => ({ text: e.message, isError: true }));
+      const result = await call(target, params.name, params.arguments ?? {}, request.headers).catch((e: Error) => ({ text: e.message, isError: true }));
       return reply({ content: [{ type: 'text', text: result.text }], isError: result.isError });
     }
     default: return Response.json({ jsonrpc: '2.0', id, error: { code: -32601, message: `Unknown method: ${method}` } });
   }
 }
 
-async function load(url: string): Promise<Json> {
+export async function load(url: string): Promise<Json> {
   const response = await fetch(url, { signal: AbortSignal.timeout(30_000) });
   if (!response.ok) throw new Error(`${url} returned HTTP ${response.status}`);
   const text = await response.text();
@@ -112,9 +130,6 @@ async function load(url: string): Promise<Json> {
 }
 
 if (import.meta.main) {
-  const entries = (Bun.env.OPENAPI_SPECS ?? '').split(/[\s,]+/).filter(Boolean).map(e => e.split(/=(.*)/s));
-  if (!entries.length) throw new Error('Set OPENAPI_SPECS to name=url pairs.');
-  const apis = new Map(await Promise.all(entries.map(async ([name, url]) => [name, compile(await load(url as string), url as string)] as [string, Api])));
-  Bun.serve({ hostname: '::', port: Number(Bun.env.PORT ?? 8080), fetch: request => handle(apis, request) });
-  console.log(JSON.stringify({ event: 'started', bun: Bun.version, tools: Object.fromEntries([...apis].map(([n, a]) => [n, a.tools.length])) }));
+  Bun.serve({ hostname: '::', port: Number(Bun.env.PORT ?? 8080), fetch: handle });
+  console.log(JSON.stringify({ event: 'started', bun: Bun.version }));
 }
