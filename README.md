@@ -65,3 +65,7 @@ bun test
 ```
 
 Tests run against real-world OpenAPI documents in `test/fixtures/` and also run during the Docker build.
+
+## License
+
+[MIT](LICENSE)
