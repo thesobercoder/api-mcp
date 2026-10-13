@@ -1,5 +1,5 @@
 // Serves any OpenAPI document as an MCP server: POST /mcp?spec=<https URL of the document>.
-// No configuration. Bifrost handles sign-in, API keys and tool filtering; this only turns MCP tool calls into HTTP requests.
+// No configuration. Authentication comes from the caller; this only turns MCP tool calls into HTTP requests.
 // It fetches whatever spec URL it is given, so keep it on a private network.
 
 type Json = any;
@@ -24,7 +24,7 @@ function deref(doc: Json, node: Json, seen: string[] = []): Json {
 export function compile(doc: Json, specUrl: string): Api {
   const server = doc.servers?.[0];
   const base = new URL((server?.url ?? '/').replace(/\{(\w+)\}/g, (_: string, v: string) => server.variables?.[v]?.default ?? ''), specUrl).href.replace(/\/$/, '');
-  // Pass on the caller's Authorization plus any API-key headers the document declares (e.g. trakt-api-key).
+  // Pass on the caller's Authorization plus any API-key headers the document declares.
   const schemes = Object.values<Json>(doc.components?.securitySchemes ?? {});
   const forward = ['authorization', ...schemes.filter(s => s.type === 'apiKey' && s.in === 'header').map(s => s.name.toLowerCase())];
   const tools: Json[] = [], ops = new Map<string, Op>();

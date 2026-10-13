@@ -28,7 +28,7 @@ test('any spec URL becomes an MCP server with resolved schemas', async () => {
   expect(JSON.stringify(tools)).not.toContain('$ref');
 });
 
-test('tool calls build the request and pass on Bifrost credentials only', async () => {
+test('tool calls build the request and pass on caller credentials only', async () => {
   const result = (await rpc(TRAKT, 'tools/call', { name: 'getSearchQuery', arguments: { type: 'movie', query: 'Dune', limit: 2 } },
     { authorization: 'Bearer user', 'trakt-api-key': 'key', cookie: 'private' })).result;
   expect(result).toEqual({ content: [{ type: 'text', text: '[{"id":1}]' }], isError: false });
